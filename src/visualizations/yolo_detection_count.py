@@ -1,12 +1,14 @@
 import os
+# pyrefly: ignore [missing-import]
 import cv2
 import numpy as np
 import matplotlib.pyplot as plt
+# pyrefly: ignore [missing-import]
 from ultralytics import YOLO
 
 IMAGE_FILES = [
-    "../../data/images/Group.JPG",
-    "../../data/images/group1.jpg",
+    "../../data/images/Image01.JPG",
+    "../../data/images/Image02.jpg",
 ]
 
 yolo = YOLO("yolov8n.pt")

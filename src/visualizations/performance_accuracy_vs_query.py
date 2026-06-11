@@ -13,15 +13,19 @@ import csv
 import numpy as np
 import matplotlib.pyplot as plt
 from PIL import Image
+# pyrefly: ignore [missing-import]
 import cv2
+# pyrefly: ignore [missing-import]
 from ultralytics import YOLO
+# pyrefly: ignore [missing-import]
 import torch
+# pyrefly: ignore [missing-import]
 import clip
 
 # ---------------- CONFIG ----------------
 IMAGE_FILES = [
-    "../../data/images/Group.JPG",
-    "../../data/images/group1.jpg"
+    "../../data/images/Image01.JPG",
+    "../../data/images/Image02.jpg"
 ]
 
 QUERIES_IMG1 = [

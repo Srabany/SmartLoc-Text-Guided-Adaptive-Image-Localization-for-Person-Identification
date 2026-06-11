@@ -1,9 +1,13 @@
 # FILE: similarity_histogram.py
+# pyrefly: ignore [missing-import]
 import torch
+# pyrefly: ignore [missing-import]
 import clip
+# pyrefly: ignore [missing-import]
 import cv2
 import numpy as np
 from PIL import Image
+# pyrefly: ignore [missing-import]
 from ultralytics import YOLO
 import matplotlib.pyplot as plt
 
@@ -14,7 +18,7 @@ device = "cuda" if torch.cuda.is_available() else "cpu"
 clip_model, preprocess = clip.load("ViT-B/32", device=device)
 yolo = YOLO("yolov8n.pt")
 
-IMAGE_PATH = "../../data/images/group.jpg"
+IMAGE_PATH = "../../data/images/Image02.jpg"
 query = "woman with curly hair"
 
 img = cv2.imread(IMAGE_PATH)

@@ -1,7 +1,10 @@
 # FILE: performance_plot.py
-import torch
+# pyrefly: ignore [missing-import]
+import torch\
+# pyrefly: ignore [missing-import]
 import clip
 import time
+# pyrefly: ignore [missing-import]
 from ultralytics import YOLO
 import matplotlib.pyplot as plt
 
@@ -15,7 +18,7 @@ text_tokens = clip.tokenize([query]).to(device)
 
 def time_yolo():
     start = time.time()
-    yolo("../../data/images/group.jpg")
+    yolo("../../data/images/Image02.jpg")
     return time.time() - start
 
 def time_clip():
