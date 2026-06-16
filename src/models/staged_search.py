@@ -40,12 +40,14 @@ YOLO_MODEL_NAME = "yolov8m.pt"
 CLIP_MODEL_NAME = "ViT-L/14"    # Best accuracy (768-dim). Use "ViT-B/32" for speed.
 
 BATCH_SIZE = 10          # images per batch during indexing
-MIN_CROP_W = 20          # minimum person crop width
-MIN_CROP_H = 20          # minimum person crop height
+MIN_CROP_W = 30          # minimum person crop width
+MIN_CROP_H = 40          # minimum person crop height
 MAX_RESULTS = 15         # max results to show per stage
 SIM_THRESHOLD = 0.18     # minimum similarity to consider a match
-MAX_DISPLAY_W = 1200     # OpenCV display max width
-MAX_DISPLAY_H = 800      # OpenCV display max height
+MAX_DISPLAY_W = 1400     # OpenCV display max width
+MAX_DISPLAY_H = 900      # OpenCV display max height
+MIN_BRIGHTNESS = 55      # reject crops darker than this (0-255 avg)
+MIN_CONTRAST = 25        # reject crops with std dev below this
 
 SUPPORTED_EXTS = {".jpg", ".jpeg", ".png", ".bmp", ".webp", ".avif"}
 
@@ -100,8 +102,8 @@ def _score_bar(score, width=12):
 def print_header():
     print(f"\n{C.CYAN}{C.BOLD}")
     print("  ╔══════════════════════════════════════════════════════════╗")
-    print("  ║         SmartLoc — Staged Person Search                 ║")
-    print("  ║         CLIP + YOLOv8  |  Terminal Edition              ║")
+    print("  ║         SmartLoc — Text Based Person Search              ║")
+    print("  ║         CLIP + YOLOv8                                    ║")
     print("  ╚══════════════════════════════════════════════════════════╝")
     print(f"{C.RESET}")
 
@@ -934,6 +936,59 @@ def filter_by_threshold(scored, threshold, max_results):
     return filtered[:max_results]
 
 
+def _is_valid_crop(img, bbox):
+    """
+    Check if a person crop is actually visible/recognizable.
+    Rejects dark blobs, washed-out crops, and tiny noise.
+    """
+    x1, y1, x2, y2 = bbox
+    crop = img[y1:y2, x1:x2]
+    if crop.size == 0:
+        return False
+    h, w = crop.shape[:2]
+    if w < MIN_CROP_W or h < MIN_CROP_H:
+        return False
+    gray = cv2.cvtColor(crop, cv2.COLOR_BGR2GRAY)
+    avg_brightness = float(np.mean(gray))
+    if avg_brightness < MIN_BRIGHTNESS:
+        return False
+    std_dev = float(np.std(gray))
+    if std_dev < MIN_CONTRAST:
+        return False
+    return True
+
+
+def filter_bad_crops(candidates, data_dir):
+    """
+    Remove candidates whose crops are too dark or lack contrast.
+    These are unrecognizable to the human eye.
+    """
+    good = []
+    for c in candidates:
+        img = _load_image(data_dir, c["image_name"])
+        if img is None:
+            continue
+        if _is_valid_crop(img, c["bbox"]):
+            good.append(c)
+    if len(good) < 3:
+        return candidates
+    return good
+
+
+def deduplicate_by_image(candidates):
+    """
+    Keep only the best scoring person per image for diverse results.
+    Prevents the same image from appearing multiple times in the grid.
+    """
+    best_per_image = {}
+    for c in candidates:
+        img_name = c["image_name"]
+        if img_name not in best_per_image or c["score"] > best_per_image[img_name]["score"]:
+            best_per_image[img_name] = c
+    deduped = list(best_per_image.values())
+    deduped.sort(key=lambda x: (-x["score"], x["image_name"]))
+    return deduped
+
 # ──────────────────────────────────────────────────────────────
 # MAIN — Staged Search Loop
 # ──────────────────────────────────────────────────────────────
@@ -1096,6 +1151,12 @@ def main():
         # Color verification: re-rank using OpenCV HSV if query contains color words
         scored = color_rerank(scored, combined_prompt, DATA_DIR)
 
+        # Filter bad crops (dark/unrecognizable blobs)
+        scored = filter_bad_crops(scored, DATA_DIR)
+
+        # Deduplicate: keep best person per image for diversity
+        scored = deduplicate_by_image(scored)
+
         filtered = filter_by_threshold(scored, SIM_THRESHOLD, MAX_RESULTS)
 
         if not filtered:
@@ -1114,10 +1175,10 @@ def main():
         print(f"\n  {C.GREEN}{C.BOLD}✓ Found {len(candidates)} match{'es' if len(candidates) != 1 else ''}:{C.RESET}")
         print_table(candidates)
 
-        # Auto-popup: premium grid of top matches
-        grid_count = min(len(candidates), 8)
+        # Auto-popup: premium grid of top matches (show up to 15)
+        grid_count = min(len(candidates), 15)
         print(f"  {C.CYAN}📸 Showing top {grid_count} — press any key in the window to continue...{C.RESET}")
-        show_top_grid(candidates, DATA_DIR, stage_num, query_text=combined_prompt, max_show=8)
+        show_top_grid(candidates, DATA_DIR, stage_num, query_text=combined_prompt, max_show=15)
 
         if len(candidates) <= 3:
             print(f"  {C.GREEN}{C.BOLD}⚡ Narrow enough!{C.RESET} Use 'view N' for full image, 'done' to finish, or keep refining.")
@@ -1125,5 +1186,7 @@ def main():
             print(f"  {C.YELLOW}Add another prompt to narrow down from {len(candidates)} candidates.{C.RESET}")
 
 
+
 if __name__ == "__main__":
     main()
+
