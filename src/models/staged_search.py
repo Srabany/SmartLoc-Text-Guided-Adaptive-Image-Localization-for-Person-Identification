@@ -15,18 +15,24 @@ Usage:
 """
 
 import os
+os.environ["KMP_DUPLICATE_LIB_OK"] = "TRUE"
 import sys
 import time
 import hashlib
 import logging
 import subprocess
 import platform
-
+import concurrent.futures
+import re
+# pyrefly: ignore [missing-import]
 import torch
 import numpy as np
 from PIL import Image
+# pyrefly: ignore [missing-import]
 import cv2
+# pyrefly: ignore [missing-import]
 from ultralytics import YOLO
+# pyrefly: ignore [missing-import]
 import clip
 
 # ──────────────────────────────────────────────────────────────
@@ -36,14 +42,14 @@ BASE_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
 DATA_DIR = os.path.join(BASE_DIR, "data", "images")
 CACHE_DIR = os.path.join(BASE_DIR, "data", ".cache")
 
-YOLO_MODEL_NAME = "yolov8m.pt"
-CLIP_MODEL_NAME = "ViT-L/14"    # Best accuracy (768-dim). Use "ViT-B/32" for speed.
+YOLO_MODEL_NAME = "yolov8n.pt"  # Faster YOLO model (Nano)
+CLIP_MODEL_NAME = "ViT-B/16"    # Smarter model than B/32, much faster than L/14
 
 BATCH_SIZE = 10          # images per batch during indexing
 MIN_CROP_W = 30          # minimum person crop width
 MIN_CROP_H = 40          # minimum person crop height
 MAX_RESULTS = 15         # max results to show per stage
-SIM_THRESHOLD = 0.18     # minimum similarity to consider a match
+SIM_THRESHOLD = 0.30     # minimum similarity to consider a match
 MAX_DISPLAY_W = 1400     # OpenCV display max width
 MAX_DISPLAY_H = 900      # OpenCV display max height
 MIN_BRIGHTNESS = 55      # reject crops darker than this (0-255 avg)
@@ -113,13 +119,23 @@ def print_divider():
 
 
 def print_stage_header(stage, pool_size, prompts):
-    """Print a styled stage header."""
-    print(f"\n  {C.CYAN}{C.BOLD}┌─── STAGE {stage} ───────────────────────────────────────┐{C.RESET}")
+    """Print a styled dynamic-width stage header."""
+    chain_plain = " → ".join(prompts) if prompts else ""
+    content_len = len(f"  Prompts: {chain_plain}") if prompts else 0
+    box_inner = max(50, content_len + 2)
+    
+    top_dashes = max(1, box_inner - 3 - len(f" STAGE {stage} "))
+    print(f"\n  {C.CYAN}{C.BOLD}┌─── STAGE {stage} {'─' * top_dashes}┐{C.RESET}")
+    
     if prompts:
         chain = f" {C.DIM}→{C.RESET} ".join(f"{C.WHITE}{p}{C.RESET}" for p in prompts)
-        print(f"  {C.CYAN}│{C.RESET}  Prompts: {chain}")
-    print(f"  {C.CYAN}│{C.RESET}  Pool: {C.BOLD}{pool_size}{C.RESET} persons")
-    print(f"  {C.CYAN}└──────────────────────────────────────────────────┘{C.RESET}")
+        padding = box_inner - len(f"  Prompts: {chain_plain}")
+        print(f"  {C.CYAN}│{C.RESET}  Prompts: {chain}{' ' * padding}{C.CYAN}│{C.RESET}")
+        
+    pool_str = f"  Pool: {pool_size} persons"
+    pool_padding = box_inner - len(pool_str)
+    print(f"  {C.CYAN}│{C.RESET}  Pool: {C.BOLD}{pool_size}{C.RESET} persons{' ' * pool_padding}{C.CYAN}│{C.RESET}")
+    print(f"  {C.CYAN}└{'─' * box_inner}┘{C.RESET}")
 
 
 def print_table(candidates, start_rank=1):
@@ -297,12 +313,13 @@ def show_top_grid(candidates, data_dir, stage, query_text="", max_show=8):
 
     # Header right: query
     if query_text:
-        qt = query_text if len(query_text) <= 50 else query_text[:47] + "..."
-        qt_size = cv2.getTextSize(qt, font, 0.38, 1)[0]
+        # Truncate if too long (up to 95 chars)
+        display_text = query_text if len(query_text) < 95 else query_text[:92] + "..."
+        qt_size = cv2.getTextSize(display_text, font, 0.38, 1)[0]
         qx = canvas_w - qt_size[0] - CARD_PAD
         cv2.putText(canvas, "Query:", (max(qx - 48, CARD_PAD), 28),
                     font, 0.35, TEXT_DARK, 1, cv2.LINE_AA)
-        cv2.putText(canvas, qt, (max(qx, CARD_PAD + 50), 28),
+        cv2.putText(canvas, display_text, (max(qx, CARD_PAD + 50), 28),
                     font, 0.38, ACCENT_AMBER, 1, cv2.LINE_AA)
 
     # Separator
@@ -310,6 +327,16 @@ def show_top_grid(candidates, data_dir, stage, query_text="", max_show=8):
              (50, 50, 55), 1, cv2.LINE_AA)
 
     # Cards
+    unique_names = list(set(c["image_name"] for c in candidates[:max_show]))
+    loaded_imgs = {}
+    def _load_img_grid(name):
+        return name, cv2.imread(os.path.join(data_dir, name))
+        
+    with concurrent.futures.ThreadPoolExecutor(max_workers=16) as executor:
+        for name, img in executor.map(_load_img_grid, unique_names):
+            if img is not None:
+                loaded_imgs[name] = img
+
     for i, c in enumerate(to_show):
         row_i = i // cols
         col_i = i % cols
@@ -334,7 +361,7 @@ def show_top_grid(candidates, data_dir, stage, query_text="", max_show=8):
                                (cx + CELL_W, cy + card_h), CARD_BORDER, radius=10, thickness=1)
 
         # Load crop
-        img = _load_image(data_dir, c["image_name"])
+        img = loaded_imgs.get(c["image_name"])
         if img is None:
             continue
         bx1, by1, bx2, by2 = c["bbox"]
@@ -596,6 +623,7 @@ def index_images(image_dir, cache, yolo_model, clip_model, preprocess, device, f
         total = len(to_process)
         processed = 0
         t_start = time.time()
+        bar_len = 40
 
         for batch_start in range(0, total, BATCH_SIZE):
             batch = to_process[batch_start:batch_start + BATCH_SIZE]
@@ -611,7 +639,7 @@ def index_images(image_dir, cache, yolo_model, clip_model, preprocess, device, f
                     continue
 
                 # YOLO person detection
-                results = yolo_model.predict(source=fpath, classes=[0], imgsz=1024, verbose=False)
+                results = yolo_model.predict(source=fpath, classes=[0], imgsz=640, verbose=False)
                 boxes = results[0].boxes.xyxy.cpu().numpy()
 
                 if len(boxes) == 0:
@@ -653,42 +681,36 @@ def index_images(image_dir, cache, yolo_model, clip_model, preprocess, device, f
                         max(x2 - mx, x1), min(torso_y2, y2)
                     ))
 
-                    # Encode all 3 crops in one batch for efficiency
-                    crops = [crop_full, crop_upper, crop_torso]
+                    # Encode only the full crop for maximum speed (3x faster than multi-crop)
+                    crops = [crop_full]
                     batch = torch.stack([preprocess(c) for c in crops]).to(device)
 
                     with torch.no_grad():
-                        feats = clip_model.encode_image(batch)     # (3, D)
+                        feats = clip_model.encode_image(batch)     # (1, D)
                         feats = feats / feats.norm(dim=-1, keepdim=True)
-                        feats = feats.cpu().numpy()                # (3, D)
+                        feats = feats.cpu().numpy()                # (1, D)
 
                     valid_bboxes.append([x1, y1, x2, y2])
                     valid_feats_full.append(feats[0])
-                    valid_feats_upper.append(feats[1])
-                    valid_feats_torso.append(feats[2])
 
                 if valid_bboxes:
                     bboxes_arr = np.array(valid_bboxes, dtype=int)
                     full_arr = np.array(valid_feats_full, dtype=np.float32)
-                    upper_arr = np.array(valid_feats_upper, dtype=np.float32)
-                    torso_arr = np.array(valid_feats_torso, dtype=np.float32)
                 else:
                     bboxes_arr = np.zeros((0, 4), dtype=int)
                     full_arr = np.zeros((0, feat_dim), dtype=np.float32)
-                    upper_arr = np.zeros((0, feat_dim), dtype=np.float32)
-                    torso_arr = np.zeros((0, feat_dim), dtype=np.float32)
 
-                cache.save(fhash, bboxes_arr, full_arr, upper_arr, torso_arr)
+                # Save None for upper/torso to signify they aren't used
+                cache.save(fhash, bboxes_arr, full_arr, None, None)
                 processed += 1
 
-            # Progress bar
-            pct = processed / total
-            bar_len = 40
-            filled = int(bar_len * pct)
-            bar = "█" * filled + "░" * (bar_len - filled)
-            elapsed = time.time() - t_start
-            eta = (elapsed / max(processed, 1)) * (total - processed)
-            print(f"\r  Processing [{bar}] {processed}/{total}  ETA: {eta:.0f}s", end="", flush=True)
+                # Progress bar
+                pct = processed / total
+                filled = int(bar_len * pct)
+                bar = "█" * filled + "░" * (bar_len - filled)
+                elapsed = time.time() - t_start
+                eta = (elapsed / max(processed, 1)) * (total - processed)
+                print(f"\r  Processing [{bar}] {processed}/{total}  ETA: {eta:.0f}s", end="", flush=True)
 
         elapsed = time.time() - t_start
         print(f"\r  Processing [{'█' * bar_len}] {total}/{total}  Done in {elapsed:.1f}s     ")
@@ -729,10 +751,8 @@ def index_images(image_dir, cache, yolo_model, clip_model, preprocess, device, f
 # that significantly improves zero-shot accuracy — used in the original paper)
 PROMPT_TEMPLATES = [
     "{}",
-    "a photo of {}",
-    "a photo of a person who is {}",
-    "a person described as {}",
-    "{}. high quality photo",
+    "a photo of a {}",
+    "a cropped photo of a {}",
 ]
 
 
@@ -774,23 +794,29 @@ def rank_candidates(candidates, text_features):
     For each person, computes similarity against full body, upper body,
     and torso crops, then takes the maximum — much more accurate overall.
     """
-    scored = []
     text_vec = text_features.squeeze(0)  # (D,)
 
-    for c in candidates:
-        # Compute similarity for each available crop
-        sims = [float(np.dot(c["features"], text_vec))]  # full body
-        if "features_upper" in c:
-            sims.append(float(np.dot(c["features_upper"], text_vec)))
-        if "features_torso" in c:
-            sims.append(float(np.dot(c["features_torso"], text_vec)))
-        # Take the MAX across all crops — best view wins
-        best_sim = max(sims)
-        scored.append({**c, "score": best_sim})
+    # Collect feature matrices
+    feats_full = np.array([c["features"] for c in candidates])
+    scores = np.dot(feats_full, text_vec)
+
+    if "features_upper" in candidates[0]:
+        feats_upper = np.array([c.get("features_upper", np.zeros_like(text_vec)) for c in candidates])
+        scores = np.maximum(scores, np.dot(feats_upper, text_vec))
+        
+    if "features_torso" in candidates[0]:
+        feats_torso = np.array([c.get("features_torso", np.zeros_like(text_vec)) for c in candidates])
+        scores = np.maximum(scores, np.dot(feats_torso, text_vec))
+
+    # Apply scores
+    for i, c in enumerate(candidates):
+        c["score"] = float(scores[i])
 
     # Stable sort: primary by score (desc), tiebreaker by name+idx (asc)
-    scored.sort(key=lambda x: (-x["score"], x["image_name"], x["person_idx"]))
-    return scored
+    candidates.sort(key=lambda x: (-x["score"], x["image_name"], x["person_idx"]))
+    
+    # Filter by similarity
+    return [c for c in candidates if c["score"] >= SIM_THRESHOLD]
 
 
 # ──────────────────────────────────────────────────────────────
@@ -800,10 +826,10 @@ def rank_candidates(candidates, text_features):
 # Color definitions in HSV space: (H_low, H_high, S_min, S_max, V_min, V_max)
 # OpenCV uses H: 0-179, S: 0-255, V: 0-255
 COLOR_RANGES = {
-    "red":     [((0, 10), 50, 255, 50, 255), ((170, 179), 50, 255, 50, 255)],  # red wraps around
+    "red":     [((0, 8), 40, 255, 40, 255), ((170, 179), 40, 255, 40, 255)],  # red wraps around
     "blue":    [((100, 130), 50, 255, 40, 255)],
     "green":   [((35, 85), 40, 255, 40, 255)],
-    "yellow":  [((20, 35), 80, 255, 80, 255)],
+    "yellow":  [((22, 30), 120, 255, 120, 255)],
     "orange":  [((10, 22), 80, 255, 80, 255)],
     "pink":    [((145, 170), 30, 255, 100, 255)],
     "purple":  [((125, 150), 40, 255, 40, 255)],
@@ -823,44 +849,64 @@ COLOR_WORDS = set(COLOR_RANGES.keys())
 
 
 def _detect_query_colors(query):
-    """Extract color names from the user's query."""
-    words = query.lower().replace(",", " ").split()
+    query_lower = query.lower()
+    
+    lower_words = ["pant", "shoe", "leg", "bottom", "short", "skirt", "trouser", "jean"]
+    upper_words = ["hat", "cap", "head", "hair", "helmet", "turban", "glass"]
+    
+    matches = []
+    for cname in COLOR_RANGES.keys():
+        for m in re.finditer(r'\b' + cname + r'\b', query_lower):
+            matches.append((m.start(), cname, m.end()))
+            
+    # Sort by their appearance in the sentence
+    matches.sort(key=lambda x: x[0])
+    
     found = []
-    for w in words:
-        if w in COLOR_WORDS:
-            found.append(w)
+    for _, cname, end_idx in matches:
+        # Only look at the next 2 words immediately following the color
+        words_after = query_lower[end_idx:].replace(',', ' ').split()[:2]
+        text_after = " ".join(words_after)
+        region = "torso"
+        if any(w in text_after for w in lower_words):
+            region = "lower"
+        elif any(w in text_after for w in upper_words):
+            region = "upper"
+        found.append((cname, region))
+        
     return found
 
 
 def _get_torso_crop(img, bbox):
-    """
-    Crop the torso/upper-body region from a person bounding box.
-    Torso: 10% to 65% from top, narrowed 8% horizontally to avoid background.
-    """
-    x1, y1, x2, y2 = bbox
-    h = y2 - y1
-    w = x2 - x1
-    torso_y1 = y1 + int(h * 0.10)
-    torso_y2 = y1 + int(h * 0.65)
-    margin_x = int(w * 0.08)
-    tx1 = max(x1 + margin_x, x1)
-    tx2 = min(x2 - margin_x, x2)
-    torso_y1 = max(torso_y1, y1)
-    torso_y2 = min(torso_y2, y2)
-    if torso_y2 <= torso_y1 or tx2 <= tx1:
-        return None
-    return img[torso_y1:torso_y2, tx1:tx2]
+    """Legacy helper, replaced by region-aware cropping."""
+    pass
 
 
-def _color_match_score(torso_bgr, color_name):
+def _color_match_score(img_bgr, color_name, region="torso"):
     """
-    Calculate how much of the torso matches the specified color.
-    Returns a ratio 0.0 to 1.0.
+    Returns the percentage (0.0 to 1.0) of the specified region area 
+    that matches the color_name's HSV ranges.
     """
-    if torso_bgr is None or torso_bgr.size == 0:
+    if img_bgr is None or img_bgr.size == 0:
         return 0.0
 
-    hsv = cv2.cvtColor(torso_bgr, cv2.COLOR_BGR2HSV)
+    # Crop to the semantic region
+    h, w = img_bgr.shape[:2]
+    if region == "lower":
+        crop_y1, crop_y2 = int(h * 0.5), h
+        crop_x1, crop_x2 = int(w * 0.1), int(w * 0.9)
+    elif region == "upper":
+        crop_y1, crop_y2 = 0, int(h * 0.35)
+        crop_x1, crop_x2 = int(w * 0.15), int(w * 0.85)
+    else:  # torso
+        crop_y1, crop_y2 = int(h * 0.2), int(h * 0.7)
+        crop_x1, crop_x2 = int(w * 0.2), int(w * 0.8)
+
+    crop = img_bgr[crop_y1:crop_y2, crop_x1:crop_x2]
+    if crop.size == 0:
+        return 0.0
+
+    hsv = cv2.cvtColor(crop, cv2.COLOR_BGR2HSV)
     ranges = COLOR_RANGES.get(color_name, [])
     if not ranges:
         return 0.0
@@ -881,52 +927,80 @@ def _color_match_score(torso_bgr, color_name):
 
 def color_rerank(candidates, query, data_dir):
     """
-    Re-rank using hybrid scoring: 40% CLIP + 60% color match.
-    This makes actual color matches rank MUCH higher than CLIP-only.
-    Also filters out candidates with very low color match.
+    Verifies that candidates match ALL detected colors in their respective regions.
     """
     colors = _detect_query_colors(query)
     if not colors:
         return candidates
 
-    color_name = colors[0]
-    print(f"  {C.CYAN}🎨 Color '{color_name}' detected — verifying torso HSV...{C.RESET}", end=" ", flush=True)
+    checks_str = ", ".join([f"{c} ({r})" for c, r in colors])
+    print(f"  \033[36m🎨 Verifying: {checks_str}...\033[0m ", end="", flush=True)
 
-    # Compute color match for all candidates
+    # To optimize I/O, only verify color for the top 200 CLIP matches.
+    top_candidates = candidates[:200]
+    unique_names = list(set(c["image_name"] for c in top_candidates))
+    
+    img_cache = {}
+    def _load_img(name):
+        return name, cv2.imread(os.path.join(data_dir, name))
+        
+    with concurrent.futures.ThreadPoolExecutor(max_workers=4) as executor:
+        for name, img in executor.map(_load_img, unique_names):
+            if img is not None:
+                img_cache[name] = img
+
     with_color = []
-    for c in candidates:
-        img = _load_image(data_dir, c["image_name"])
+    for c in top_candidates:
+        img_name = c["image_name"]
+        img = img_cache.get(img_name)
         if img is None:
-            with_color.append({**c, "color_match": 0.0})
+            with_color.append({**c, "color_match": 0.0, "_all_ratios": []})
             continue
-        torso = _get_torso_crop(img, c["bbox"])
-        match_ratio = _color_match_score(torso, color_name)
-        with_color.append({**c, "color_match": match_ratio})
+            
+        x1, y1, x2, y2 = c["bbox"]
+        crop = img[y1:y2, x1:x2]
+        
+        # Verify ALL detected colors
+        color_ratios = []
+        for color_name, region in colors:
+            ratio = _color_match_score(crop, color_name, region)
+            
+            # Dynamic threshold: hats are small (3%), pants/shirts are big (10%)
+            req_thresh = 0.03 if region == "upper" else 0.10
+            color_ratios.append((ratio, req_thresh))
+            
+        avg_ratio = sum(r for r, t in color_ratios) / len(color_ratios) if color_ratios else 0.0
+        with_color.append({**c, "color_match": avg_ratio, "_all_ratios": color_ratios})
 
-    # Normalize CLIP scores to 0-1 for fair blending
+    # Normalize CLIP scores
     clip_scores = [c["score"] for c in with_color]
     clip_min = min(clip_scores) if clip_scores else 0
     clip_max = max(clip_scores) if clip_scores else 1
     clip_range = max(clip_max - clip_min, 0.001)
 
-    # Hybrid: 40% CLIP (normalized) + 60% actual color match
-    CLIP_W = 0.40
-    COLOR_W = 0.60
-
     reranked = []
     for c in with_color:
         clip_norm = (c["score"] - clip_min) / clip_range
         color_ratio = min(c["color_match"], 1.0)
+        
+        CLIP_W = 0.95
+        COLOR_W = 0.05
         hybrid = CLIP_W * clip_norm + COLOR_W * color_ratio
         reranked.append({**c, "score": hybrid})
 
-    # Filter: remove candidates with <5% color match
-    color_ok = [c for c in reranked if c["color_match"] >= 0.05]
-    if len(color_ok) < 3:
+    reranked.sort(key=lambda x: -x["score"])
+    
+    # STRICT FILTER: Candidate must pass the dynamic threshold for EVERY required color
+    color_ok = []
+    for c in reranked:
+        if all(r >= t for r, t in c.get("_all_ratios", [])):
+            color_ok.append(c)
+            
+    # Fallback if too strict
+    if len(color_ok) < 1:
         color_ok = sorted(reranked, key=lambda x: -x["score"])[:15]
 
     color_ok.sort(key=lambda x: (-x["score"], x["image_name"], x["person_idx"]))
-    print(f"{C.GREEN}done{C.RESET}")
     return color_ok
 
 
@@ -1056,7 +1130,7 @@ def main():
         print_stage_header(stage, pool_size, prompts)
 
         if candidates is not None:
-            print(f"  {C.DIM}Commands: view N │ back │ reset │ done │ quit{C.RESET}")
+            print(f"  {C.DIM}Commands: view N │ back │ {C.YELLOW}reset (start new search){C.DIM} │ done │ quit{C.RESET}")
         else:
             print(f"  {C.DIM}Commands: quit{C.RESET}")
 
@@ -1148,8 +1222,11 @@ def main():
         scored = rank_candidates(pool, text_features)
         print(f"{C.GREEN}done{C.RESET}")
 
-        # Color verification: re-rank using OpenCV HSV if query contains color words
-        scored = color_rerank(scored, combined_prompt, DATA_DIR)
+        # Color reranking if needed
+        colors = _detect_query_colors(combined_prompt)
+        if colors:
+            scored = color_rerank(scored, combined_prompt, DATA_DIR)
+            print(f"{C.GREEN}done{C.RESET}")
 
         # Filter bad crops (dark/unrecognizable blobs)
         scored = filter_bad_crops(scored, DATA_DIR)
