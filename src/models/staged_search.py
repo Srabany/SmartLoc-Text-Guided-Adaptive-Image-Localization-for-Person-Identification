@@ -289,7 +289,10 @@ def show_top_grid(candidates, data_dir, stage, query_text="", max_show=8):
     rows = (n + cols - 1) // cols
     card_h = CELL_H + INFO_H
 
-    canvas_w = cols * (CELL_W + CARD_PAD) + CARD_PAD
+    content_w = cols * (CELL_W + CARD_PAD) + CARD_PAD
+    canvas_w = max(640, content_w)  # Ensure enough space for header text
+    offset_x = (canvas_w - content_w) // 2
+
     canvas_h = rows * (card_h + CARD_PAD) + CARD_PAD + HEADER_H + FOOTER_H
     canvas = np.zeros((canvas_h, canvas_w, 3), dtype=np.uint8)
     canvas[:] = BG_COLOR
@@ -313,14 +316,25 @@ def show_top_grid(candidates, data_dir, stage, query_text="", max_show=8):
 
     # Header right: query
     if query_text:
-        # Truncate if too long (up to 95 chars)
-        display_text = query_text if len(query_text) < 95 else query_text[:92] + "..."
-        qt_size = cv2.getTextSize(display_text, font, 0.38, 1)[0]
-        qx = canvas_w - qt_size[0] - CARD_PAD
-        cv2.putText(canvas, "Query:", (max(qx - 48, CARD_PAD), 28),
-                    font, 0.35, TEXT_DARK, 1, cv2.LINE_AA)
-        cv2.putText(canvas, display_text, (max(qx, CARD_PAD + 50), 28),
-                    font, 0.38, ACCENT_AMBER, 1, cv2.LINE_AA)
+        sl_size = cv2.getTextSize("SmartLoc", font, 0.75, 2)[0]
+        safe_left = CARD_PAD + sl_size[0] + 30
+        q_label_w = cv2.getTextSize("Query: ", font, 0.35, 1)[0][0]
+        
+        max_w = canvas_w - safe_left - q_label_w - CARD_PAD
+        
+        display_text = query_text
+        if max_w > 30:  # Only show if we have minimal space
+            if cv2.getTextSize(display_text, font, 0.38, 1)[0][0] > max_w:
+                while len(display_text) > 0 and cv2.getTextSize(display_text + "...", font, 0.38, 1)[0][0] > max_w:
+                    display_text = display_text[:-1]
+                display_text += "..."
+                
+            qt_size = cv2.getTextSize(display_text, font, 0.38, 1)[0]
+            qx = canvas_w - qt_size[0] - CARD_PAD
+            cv2.putText(canvas, "Query:", (qx - q_label_w, 28),
+                        font, 0.35, TEXT_DARK, 1, cv2.LINE_AA)
+            cv2.putText(canvas, display_text, (qx, 28),
+                        font, 0.38, ACCENT_AMBER, 1, cv2.LINE_AA)
 
     # Separator
     cv2.line(canvas, (CARD_PAD, HEADER_H - 4), (canvas_w - CARD_PAD, HEADER_H - 4),
@@ -341,7 +355,7 @@ def show_top_grid(candidates, data_dir, stage, query_text="", max_show=8):
         row_i = i // cols
         col_i = i % cols
 
-        cx = col_i * (CELL_W + CARD_PAD) + CARD_PAD
+        cx = offset_x + col_i * (CELL_W + CARD_PAD) + CARD_PAD
         cy = row_i * (card_h + CARD_PAD) + CARD_PAD + HEADER_H
 
         accent = _score_accent(c["score"])
@@ -972,41 +986,49 @@ def color_rerank(candidates, query, data_dir):
         avg_ratio = sum(r for r, t in color_ratios) / len(color_ratios) if color_ratios else 0.0
         with_color.append({**c, "color_match": avg_ratio, "_all_ratios": color_ratios})
 
-    # Normalize CLIP scores
-    clip_scores = [c["score"] for c in with_color]
-    clip_min = min(clip_scores) if clip_scores else 0
-    clip_max = max(clip_scores) if clip_scores else 1
-    clip_range = max(clip_max - clip_min, 0.001)
-
-    reranked = []
+    # STRICT FILTER: Candidate must pass the dynamic threshold for EVERY required color
+    filtered_cands = []
     for c in with_color:
-        clip_norm = (c["score"] - clip_min) / clip_range
+        if all(r >= t for r, t in c.get("_all_ratios", [])):
+            filtered_cands.append(c)
+            
+    # Fallback if too strict
+    if len(filtered_cands) < 1:
+        filtered_cands = with_color
+
+    # Normalize CLIP scores: use global minimum as baseline, but maximum among valid matches as ceiling
+    global_clip_min = min((c["score"] for c in with_color), default=0)
+    clip_max = max((c["score"] for c in filtered_cands), default=1)
+    clip_range = max(clip_max - global_clip_min, 0.001)
+
+    color_ok = []
+    for c in filtered_cands:
+        # clamp to 0 in case somehow a score is below global min
+        clip_norm = max(0.0, (c["score"] - global_clip_min) / clip_range)
         color_ratio = min(c["color_match"], 1.0)
         
         CLIP_W = 0.95
         COLOR_W = 0.05
         hybrid = CLIP_W * clip_norm + COLOR_W * color_ratio
-        reranked.append({**c, "score": hybrid})
-
-    reranked.sort(key=lambda x: -x["score"])
-    
-    # STRICT FILTER: Candidate must pass the dynamic threshold for EVERY required color
-    color_ok = []
-    for c in reranked:
-        if all(r >= t for r, t in c.get("_all_ratios", [])):
-            color_ok.append(c)
-            
-    # Fallback if too strict
-    if len(color_ok) < 1:
-        color_ok = sorted(reranked, key=lambda x: -x["score"])[:15]
+        color_ok.append({**c, "score": hybrid})
 
     color_ok.sort(key=lambda x: (-x["score"], x["image_name"], x["person_idx"]))
     return color_ok
 
 
 def filter_by_threshold(scored, threshold, max_results):
-    """Keep candidates above threshold, capped at max_results."""
+    """Keep candidates above absolute threshold, apply relative drop-off, capped at max_results."""
+    if not scored:
+        return []
+        
     filtered = [c for c in scored if c["score"] >= threshold]
+    
+    # Relative drop-off: if the top match is very strong, drop matches that are significantly worse
+    if filtered:
+        best_score = filtered[0]["score"]
+        rel_threshold = best_score - 0.35
+        filtered = [c for c in filtered if c["score"] >= rel_threshold]
+        
     return filtered[:max_results]
 
 
@@ -1247,7 +1269,7 @@ def main():
             continue
 
         candidates = filtered
-        stage_num = len(prompts)
+        stage_num = len(prompts) + 1
 
         print(f"\n  {C.GREEN}{C.BOLD}✓ Found {len(candidates)} match{'es' if len(candidates) != 1 else ''}:{C.RESET}")
         print_table(candidates)
@@ -1266,4 +1288,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
